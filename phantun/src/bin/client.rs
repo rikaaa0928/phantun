@@ -1,6 +1,6 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{Socket, Stack};
+use fake_tcp::{PayloadPaddingConfig, Socket, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
@@ -101,6 +101,22 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("payload_padding")
+                .long("payload-padding")
+                .required(false)
+                .help("Prefix outgoing payload with a random padding block before the real payload; must be enabled on both client and server")
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("payload_padding_max_len")
+                .long("payload-padding-max-len")
+                .required(false)
+                .value_name("LEN")
+                .help("Maximum random padding length added before each payload when --payload-padding is enabled on both client and server")
+                .value_parser(clap::value_parser!(u8).range(1..=255))
+                .default_value("5")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -147,6 +163,12 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let payload_padding = PayloadPaddingConfig {
+        enabled: matches.get_flag("payload_padding"),
+        max_len: *matches
+            .get_one::<u8>("payload_padding_max_len")
+            .expect("payload padding max len has a default"),
+    };
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -169,13 +191,14 @@ async fn main() -> io::Result<()> {
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
-    let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    let mut stack = Stack::new_with_config(tun, tun_peer, tun_peer6, payload_padding);
 
     let main_loop = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
@@ -207,11 +230,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, sock.clone())
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, sock.clone())
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -237,10 +262,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -251,7 +273,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);

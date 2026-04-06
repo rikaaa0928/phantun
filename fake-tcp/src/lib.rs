@@ -45,14 +45,14 @@ pub mod packet;
 use bytes::{Bytes, BytesMut};
 use log::{error, info, trace, warn};
 use packet::*;
-use pnet::packet::{tcp, Packet};
+use pnet::packet::{Packet, tcp};
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, RwLock,
+    atomic::{AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -64,6 +64,21 @@ const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
+
+#[derive(Clone, Copy, Debug)]
+pub struct PayloadPaddingConfig {
+    pub enabled: bool,
+    pub max_len: u8,
+}
+
+impl Default for PayloadPaddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_len: 5,
+        }
+    }
+}
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct AddrTuple {
@@ -86,6 +101,7 @@ struct Shared {
     tun: Vec<Arc<Tun>>,
     ready: mpsc::Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
+    payload_padding: PayloadPaddingConfig,
 }
 
 pub struct Stack {
@@ -122,6 +138,46 @@ pub struct Socket {
 /// To close a TCP connection that is no longer needed, simply drop this object
 /// out of scope.
 impl Socket {
+    fn encode_payload(payload: &[u8], config: PayloadPaddingConfig) -> Bytes {
+        if !config.enabled {
+            return Bytes::copy_from_slice(payload);
+        }
+
+        let mut rng = SmallRng::from_os_rng();
+        let padding_len = rng.random_range(1..=config.max_len);
+        let padding_len_first = rng.random_range(0..=padding_len);
+        let padding_len_second = padding_len - padding_len_first;
+        let padding_len = padding_len as usize;
+        let total_len = 2 + padding_len + payload.len();
+        let mut framed_payload = BytesMut::with_capacity(total_len);
+        framed_payload.extend_from_slice(&[padding_len_first, padding_len_second]);
+
+        let mut padding = vec![0u8; padding_len];
+        rng.fill_bytes(&mut padding);
+        framed_payload.extend_from_slice(&padding);
+        framed_payload.extend_from_slice(payload);
+
+        framed_payload.freeze()
+    }
+
+    fn decode_payload<'a>(payload: &'a [u8], config: PayloadPaddingConfig) -> Option<&'a [u8]> {
+        if !config.enabled || payload.is_empty() {
+            return Some(payload);
+        }
+
+        if payload.len() < 2 {
+            return None;
+        }
+
+        let padding_len = payload[0] as usize + payload[1] as usize;
+        let header_len = 2 + padding_len;
+        if padding_len == 0 || payload.len() < header_len {
+            return None;
+        }
+
+        Some(&payload[header_len..])
+    }
+
     fn new(
         shared: Arc<Shared>,
         tun: Arc<Tun>,
@@ -172,7 +228,8 @@ impl Socket {
     pub async fn send(&self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
-                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
+                let payload = Self::encode_payload(payload, self.shared.payload_padding);
+                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload.as_ref()));
                 self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 self.tun.send(&buf).await.ok().and(Some(()))
             }
@@ -213,6 +270,13 @@ impl Socket {
                         }
                     }
 
+                    let payload = match Self::decode_payload(payload, self.shared.payload_padding) {
+                        Some(payload) => payload,
+                        None => {
+                            warn!("Connection {} received malformed padded payload", self);
+                            return None;
+                        }
+                    };
                     buf[..payload.len()].copy_from_slice(payload);
 
                     Some(payload.len())
@@ -362,6 +426,20 @@ impl Stack {
     /// of reader will be spawned later. This allows user to utilize the performance
     /// benefit of Multiqueue Tun support on machines with SMP.
     pub fn new(tun: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
+        Self::new_with_config(tun, local_ip, local_ip6, PayloadPaddingConfig::default())
+    }
+
+    /// Create a new stack with optional payload padding support.
+    pub fn new_with_config(
+        tun: Vec<Tun>,
+        local_ip: Ipv4Addr,
+        local_ip6: Option<Ipv6Addr>,
+        payload_padding: PayloadPaddingConfig,
+    ) -> Stack {
+        let payload_padding = PayloadPaddingConfig {
+            enabled: payload_padding.enabled,
+            max_len: payload_padding.max_len.max(1),
+        };
         let tun: Vec<Arc<Tun>> = tun.into_iter().map(Arc::new).collect();
         let (ready_tx, ready_rx) = mpsc::channel(MPSC_BUFFER_LEN);
         let (tuples_purge_tx, _tuples_purge_rx) = broadcast::channel(16);
@@ -371,6 +449,7 @@ impl Stack {
             listening: RwLock::new(HashSet::new()),
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
+            payload_padding,
         });
 
         for t in tun {
@@ -556,5 +635,76 @@ impl Stack {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PayloadPaddingConfig, Socket};
+
+    #[test]
+    fn decode_payload_returns_original_when_padding_disabled() {
+        let payload = [1u8, 2, 3, 4];
+        let config = PayloadPaddingConfig {
+            enabled: false,
+            max_len: 5,
+        };
+
+        assert_eq!(Socket::decode_payload(&payload, config).unwrap(), &payload);
+    }
+
+    #[test]
+    fn decode_payload_strips_padding_frame() {
+        let payload = b"hello";
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&[1, 2]);
+        framed.extend_from_slice(&[9, 8, 7]);
+        framed.extend_from_slice(payload);
+
+        let config = PayloadPaddingConfig {
+            enabled: true,
+            max_len: 5,
+        };
+
+        assert_eq!(Socket::decode_payload(&framed, config).unwrap(), payload);
+    }
+
+    #[test]
+    fn decode_payload_rejects_invalid_padding_frame() {
+        let framed = [1u8, 2, 9];
+        let config = PayloadPaddingConfig {
+            enabled: true,
+            max_len: 5,
+        };
+
+        assert!(Socket::decode_payload(&framed, config).is_none());
+    }
+
+    #[test]
+    fn encode_payload_without_padding_is_passthrough() {
+        let payload = b"hello";
+        let config = PayloadPaddingConfig {
+            enabled: false,
+            max_len: 5,
+        };
+
+        let encoded = Socket::encode_payload(payload, config);
+        assert_eq!(encoded.as_ref(), payload);
+    }
+
+    #[test]
+    fn encode_payload_with_padding_uses_two_byte_sum_header() {
+        let payload = b"hello";
+        let config = PayloadPaddingConfig {
+            enabled: true,
+            max_len: 5,
+        };
+
+        let encoded = Socket::encode_payload(payload, config);
+        let padding_len = encoded[0] as usize + encoded[1] as usize;
+
+        assert!((1..=5).contains(&padding_len));
+        assert_eq!(encoded.len(), 2 + padding_len + payload.len());
+        assert_eq!(&encoded[2 + padding_len..], payload);
     }
 }

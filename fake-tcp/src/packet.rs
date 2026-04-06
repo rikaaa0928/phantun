@@ -153,7 +153,7 @@ pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)
 mod benchmarks {
     extern crate test;
     use super::*;
-    use test::{black_box, Bencher};
+    use test::{Bencher, black_box};
 
     #[bench]
     fn bench_build_tcp_packet_1460(b: &mut Bencher) {

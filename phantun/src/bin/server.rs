@@ -1,6 +1,6 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::Stack;
+use fake_tcp::{PayloadPaddingConfig, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
@@ -101,6 +101,22 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("payload_padding")
+                .long("payload-padding")
+                .required(false)
+                .help("Prefix outgoing payload with a random padding block before the real payload; must be enabled on both client and server")
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("payload_padding_max_len")
+                .long("payload-padding-max-len")
+                .required(false)
+                .value_name("LEN")
+                .help("Maximum random padding length added before each payload when --payload-padding is enabled on both client and server")
+                .value_parser(clap::value_parser!(u8).range(1..=255))
+                .default_value("5")
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -146,6 +162,12 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let payload_padding = PayloadPaddingConfig {
+        enabled: matches.get_flag("payload_padding"),
+        max_len: *matches
+            .get_one::<u8>("payload_padding_max_len")
+            .expect("payload padding max len has a default"),
+    };
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -166,7 +188,7 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     //thread::sleep(time::Duration::from_secs(5));
-    let mut stack = Stack::new(tun, tun_local, tun_local6);
+    let mut stack = Stack::new_with_config(tun, tun_local, tun_local6, payload_padding);
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 

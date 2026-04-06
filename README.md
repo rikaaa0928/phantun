@@ -205,6 +205,10 @@ sudo setcap cap_net_admin=+pe phantun_client
 
 **Note:** Run Phantun executable with `-h` option to see full detailed options.
 
+To add random padding before each real payload, enable `--payload-padding` on both client and
+server. Use `--payload-padding-max-len` to control the maximum padding length. The minimum value
+is `1`, and the default maximum is `5`.
+
 [Back to TOC](#table-of-contents)
 
 ### Server
@@ -391,4 +395,3 @@ option. Files in the project may not be
 copied, modified, or distributed except according to those terms.
 
 [Back to TOC](#table-of-contents)
-
