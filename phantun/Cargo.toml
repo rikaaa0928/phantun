@@ -22,3 +22,4 @@ neli = "0"
 nix = { version = "0", features = ["net", "uio", "socket"] }
 tokio = { workspace = true }
 log = { workspace = true }
+mimalloc = "0.1"
