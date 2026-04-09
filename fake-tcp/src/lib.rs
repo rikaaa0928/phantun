@@ -160,7 +160,7 @@ impl Socket {
         framed_payload.freeze()
     }
 
-    fn decode_payload<'a>(payload: &'a [u8], config: PayloadPaddingConfig) -> Option<&'a [u8]> {
+    fn decode_payload(payload: &[u8], config: PayloadPaddingConfig) -> Option<&[u8]> {
         if !config.enabled || payload.is_empty() {
             return Some(payload);
         }
