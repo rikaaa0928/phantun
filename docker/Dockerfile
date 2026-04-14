@@ -5,7 +5,7 @@
 #
 # Build stage
 #
-FROM rust:latest AS builder
+FROM docker.xiaomi.dad/docker-io/rust:latest AS builder
 
 COPY . /phantun
 
@@ -20,7 +20,7 @@ RUN cd phantun \
 #
 # Runtime stage
 #
-FROM debian:latest
+FROM docker.xiaomi.dad/docker-io/debian:latest
 
 COPY --from=builder /usr/local/bin/phantun-server /usr/local/bin/
 COPY --from=builder /usr/local/bin/phantun-client /usr/local/bin/
