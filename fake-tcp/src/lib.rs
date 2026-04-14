@@ -145,8 +145,8 @@ impl Socket {
 
         let mut rng = SmallRng::from_os_rng();
         let padding_len = rng.random_range(1..=config.max_len);
-        let padding_len_first = rng.random_range(0..=padding_len);
-        let padding_len_second = padding_len - padding_len_first;
+        let padding_len_first = rng.random_range(1..=127u8);
+        let padding_len_second = padding_len.wrapping_sub(padding_len_first);
         let padding_len = padding_len as usize;
         let total_len = 2 + padding_len + payload.len();
         let mut framed_payload = BytesMut::with_capacity(total_len);
@@ -160,7 +160,7 @@ impl Socket {
         framed_payload.freeze()
     }
 
-    fn decode_payload<'a>(payload: &'a [u8], config: PayloadPaddingConfig) -> Option<&'a [u8]> {
+    fn decode_payload(payload: &[u8], config: PayloadPaddingConfig) -> Option<&[u8]> {
         if !config.enabled || payload.is_empty() {
             return Some(payload);
         }
@@ -169,7 +169,7 @@ impl Socket {
             return None;
         }
 
-        let padding_len = payload[0] as usize + payload[1] as usize;
+        let padding_len = payload[0].wrapping_add(payload[1]) as usize;
         let header_len = 2 + padding_len;
         if padding_len == 0 || payload.len() < header_len {
             return None;
@@ -701,7 +701,7 @@ mod tests {
         };
 
         let encoded = Socket::encode_payload(payload, config);
-        let padding_len = encoded[0] as usize + encoded[1] as usize;
+        let padding_len = encoded[0].wrapping_add(encoded[1]) as usize;
 
         assert!((1..=5).contains(&padding_len));
         assert_eq!(encoded.len(), 2 + padding_len + payload.len());
