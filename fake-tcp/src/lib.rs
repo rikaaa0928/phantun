@@ -52,7 +52,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -80,6 +80,17 @@ impl Default for PayloadPaddingConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServerHandshakeConfig {
+    pub allow_syn_extensions: bool,
+    pub accept_nonzero_syn_seq: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClientHandshakeConfig {
+    pub realistic_syn: bool,
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct AddrTuple {
     local_addr: SocketAddr,
@@ -102,6 +113,9 @@ struct Shared {
     ready: mpsc::Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
     payload_padding: PayloadPaddingConfig,
+    allow_syn_extensions: AtomicBool,
+    accept_nonzero_syn_seq: AtomicBool,
+    realistic_syn: AtomicBool,
 }
 
 pub struct Stack {
@@ -187,6 +201,11 @@ impl Socket {
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
+        let initial_seq = if ack.is_none() && shared.realistic_syn.load(Ordering::Relaxed) {
+            SmallRng::from_os_rng().random::<u32>()
+        } else {
+            0
+        };
 
         (
             Socket {
@@ -195,7 +214,7 @@ impl Socket {
                 incoming: incoming_rx,
                 local_addr,
                 remote_addr,
-                seq: AtomicU32::new(0),
+                seq: AtomicU32::new(initial_seq),
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state,
@@ -207,14 +226,23 @@ impl Socket {
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
+        let packet_style =
+            if flags == tcp::TcpFlags::SYN && self.shared.realistic_syn.load(Ordering::Relaxed) {
+                TcpPacketStyle::Realistic
+            } else if payload.is_some() && self.shared.realistic_syn.load(Ordering::Relaxed) {
+                TcpPacketStyle::Realistic
+            } else {
+                TcpPacketStyle::Minimal
+            };
 
-        build_tcp_packet(
+        build_tcp_packet_with_style(
             self.local_addr,
             self.remote_addr,
             self.seq.load(Ordering::Relaxed),
             ack,
             flags,
             payload,
+            packet_style,
         )
     }
 
@@ -450,6 +478,9 @@ impl Stack {
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
             payload_padding,
+            allow_syn_extensions: AtomicBool::new(false),
+            accept_nonzero_syn_seq: AtomicBool::new(false),
+            realistic_syn: AtomicBool::new(false),
         });
 
         for t in tun {
@@ -471,6 +502,21 @@ impl Stack {
     /// Listens for incoming connections on the given `port`.
     pub fn listen(&mut self, port: u16) {
         assert!(self.shared.listening.write().unwrap().insert(port));
+    }
+
+    pub fn set_server_handshake_config(&self, config: ServerHandshakeConfig) {
+        self.shared
+            .allow_syn_extensions
+            .store(config.allow_syn_extensions, Ordering::Relaxed);
+        self.shared
+            .accept_nonzero_syn_seq
+            .store(config.accept_nonzero_syn_seq, Ordering::Relaxed);
+    }
+
+    pub fn set_client_handshake_config(&self, config: ClientHandshakeConfig) {
+        self.shared
+            .realistic_syn
+            .store(config.realistic_syn, Ordering::Relaxed);
     }
 
     /// Accepts an incoming connection.
@@ -574,7 +620,10 @@ impl Stack {
                                 }
                             }
 
-                            if tcp_packet.get_flags() == tcp::TcpFlags::SYN
+                            if is_server_syn(
+                                tcp_packet.get_flags(),
+                                shared.allow_syn_extensions.load(Ordering::Relaxed),
+                            )
                                 && shared
                                     .listening
                                     .read()
@@ -582,13 +631,15 @@ impl Stack {
                                     .contains(&tcp_packet.get_destination())
                             {
                                 // SYN seen on listening socket
-                                if tcp_packet.get_sequence() == 0 {
+                                if shared.accept_nonzero_syn_seq.load(Ordering::Relaxed)
+                                    || tcp_packet.get_sequence() == 0
+                                {
                                     let (sock, incoming) = Socket::new(
                                         shared.clone(),
                                         tun.clone(),
                                         local_addr,
                                         remote_addr,
-                                        Some(tcp_packet.get_sequence() + 1),
+                                        Some(tcp_packet.get_sequence().wrapping_add(1)),
                                         State::Idle,
                                     );
                                     assert!(shared
@@ -638,9 +689,24 @@ impl Stack {
     }
 }
 
+fn is_server_syn(flags: u8, allow_syn_extensions: bool) -> bool {
+    if !allow_syn_extensions {
+        return flags == tcp::TcpFlags::SYN;
+    }
+
+    (flags & tcp::TcpFlags::SYN) != 0
+        && (flags & (tcp::TcpFlags::ACK | tcp::TcpFlags::FIN | tcp::TcpFlags::RST)) == 0
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PayloadPaddingConfig, Socket};
+    use super::{
+        ClientHandshakeConfig, PayloadPaddingConfig, ServerHandshakeConfig, Socket, is_server_syn,
+    };
+    use crate::packet::{TcpPacketStyle, build_tcp_packet_with_style, parse_ip_packet};
+    use pnet::packet::Packet;
+    use pnet::packet::tcp;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn decode_payload_returns_original_when_padding_disabled() {
@@ -706,5 +772,92 @@ mod tests {
         assert!((1..=5).contains(&padding_len));
         assert_eq!(encoded.len(), 2 + padding_len + payload.len());
         assert_eq!(&encoded[2 + padding_len..], payload);
+    }
+
+    #[test]
+    fn server_handshake_config_defaults_disabled() {
+        let config = ServerHandshakeConfig::default();
+        assert!(!config.allow_syn_extensions);
+        assert!(!config.accept_nonzero_syn_seq);
+    }
+
+    #[test]
+    fn client_handshake_config_defaults_disabled() {
+        let config = ClientHandshakeConfig::default();
+        assert!(!config.realistic_syn);
+    }
+
+    #[test]
+    fn strict_server_syn_matching_only_accepts_plain_syn() {
+        assert!(is_server_syn(tcp::TcpFlags::SYN, false));
+        assert!(!is_server_syn(
+            tcp::TcpFlags::SYN | tcp::TcpFlags::ECE | tcp::TcpFlags::CWR,
+            false,
+        ));
+    }
+
+    #[test]
+    fn relaxed_server_syn_matching_accepts_ecn_syn() {
+        assert!(is_server_syn(
+            tcp::TcpFlags::SYN | tcp::TcpFlags::ECE | tcp::TcpFlags::CWR,
+            true,
+        ));
+        assert!(!is_server_syn(
+            tcp::TcpFlags::SYN | tcp::TcpFlags::ACK,
+            true,
+        ));
+        assert!(!is_server_syn(
+            tcp::TcpFlags::SYN | tcp::TcpFlags::FIN,
+            true,
+        ));
+        assert!(!is_server_syn(
+            tcp::TcpFlags::SYN | tcp::TcpFlags::RST,
+            true,
+        ));
+    }
+
+    #[test]
+    fn realistic_syn_builder_adds_common_extensions() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 168, 200, 2), 40000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 9280);
+        let packet = build_tcp_packet_with_style(
+            local.into(),
+            remote.into(),
+            42,
+            0,
+            tcp::TcpFlags::SYN,
+            None,
+            TcpPacketStyle::Realistic,
+        );
+        let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
+        let options = tcp_packet.get_options();
+
+        assert_eq!(
+            tcp_packet.get_flags(),
+            tcp::TcpFlags::SYN | tcp::TcpFlags::ECE | tcp::TcpFlags::CWR
+        );
+        assert_eq!(tcp_packet.packet().len(), 40);
+        assert_eq!(options.len(), 5);
+    }
+
+    #[test]
+    fn realistic_payload_packets_use_psh_ack() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 168, 200, 2), 40000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 9280);
+        let packet = build_tcp_packet_with_style(
+            local.into(),
+            remote.into(),
+            42,
+            99,
+            tcp::TcpFlags::ACK,
+            Some(b"hello"),
+            TcpPacketStyle::Realistic,
+        );
+        let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
+
+        assert_eq!(
+            tcp_packet.get_flags(),
+            tcp::TcpFlags::ACK | tcp::TcpFlags::PSH
+        );
     }
 }

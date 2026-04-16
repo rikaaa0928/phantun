@@ -3,7 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{PayloadPaddingConfig, Stack};
+use fake_tcp::{PayloadPaddingConfig, ServerHandshakeConfig, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
@@ -120,6 +120,20 @@ async fn main() -> io::Result<()> {
                 .value_parser(clap::value_parser!(u8).range(1..=255))
                 .default_value("5")
         )
+        .arg(
+            Arg::new("accept_syn_extensions")
+                .long("accept-syn-extensions")
+                .required(false)
+                .help("Accept incoming SYN packets that include SYN without ACK/FIN/RST, allowing ECN bits such as ECE/CWR")
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("accept_nonzero_syn_seq")
+                .long("accept-nonzero-syn-seq")
+                .required(false)
+                .help("Accept incoming SYN packets whose initial TCP sequence number is not zero")
+                .action(ArgAction::SetTrue)
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -192,6 +206,10 @@ async fn main() -> io::Result<()> {
 
     //thread::sleep(time::Duration::from_secs(5));
     let mut stack = Stack::new_with_config(tun, tun_local, tun_local6, payload_padding);
+    stack.set_server_handshake_config(ServerHandshakeConfig {
+        allow_syn_extensions: matches.get_flag("accept_syn_extensions"),
+        accept_nonzero_syn_seq: matches.get_flag("accept_nonzero_syn_seq"),
+    });
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 

@@ -4,6 +4,7 @@ use pnet::packet::Packet;
 use pnet::packet::{ip, ipv4, ipv6, tcp};
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
@@ -13,6 +14,13 @@ pub const MAX_PACKET_LEN: usize = 1500;
 pub enum IPPacket<'p> {
     V4(ipv4::Ipv4Packet<'p>),
     V6(ipv6::Ipv6Packet<'p>),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TcpPacketStyle {
+    #[default]
+    Minimal,
+    Realistic,
 }
 
 impl IPPacket<'_> {
@@ -39,12 +47,33 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
 ) -> Bytes {
+    build_tcp_packet_with_style(
+        local_addr,
+        remote_addr,
+        seq,
+        ack,
+        flags,
+        payload,
+        TcpPacketStyle::Minimal,
+    )
+}
+
+pub fn build_tcp_packet_with_style(
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Option<&[u8]>,
+    packet_style: TcpPacketStyle,
+) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
     };
-    let wscale = (flags & tcp::TcpFlags::SYN) != 0;
-    let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
+    let syn_options = tcp_syn_options(flags, packet_style);
+    let tcp_flags = tcp_flags_with_packet_style(flags, payload, packet_style);
+    let tcp_header_len = TCP_HEADER_LEN + syn_options.iter().map(tcp_option_size).sum::<usize>();
     let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
     let total_len = ip_header_len + tcp_total_len;
     let mut buf = BytesMut::zeroed(total_len);
@@ -86,11 +115,10 @@ pub fn build_tcp_packet(
     tcp.set_destination(remote_addr.port());
     tcp.set_sequence(seq);
     tcp.set_acknowledgement(ack);
-    tcp.set_flags(flags);
-    tcp.set_data_offset(TCP_HEADER_LEN as u8 / 4 + if wscale { 1 } else { 0 });
-    if wscale {
-        let wscale = tcp::TcpOption::wscale(14);
-        tcp.set_options(&[tcp::TcpOption::nop(), wscale]);
+    tcp.set_flags(tcp_flags);
+    tcp.set_data_offset((tcp_header_len / 4) as u8);
+    if !syn_options.is_empty() {
+        tcp.set_options(&syn_options);
     }
 
     if let Some(payload) = payload {
@@ -125,6 +153,55 @@ pub fn build_tcp_packet(
 
     ip_buf.unsplit(tcp_buf);
     ip_buf.freeze()
+}
+
+fn tcp_flags_with_packet_style(
+    flags: u8,
+    payload: Option<&[u8]>,
+    packet_style: TcpPacketStyle,
+) -> u8 {
+    if packet_style != TcpPacketStyle::Realistic {
+        return flags;
+    }
+
+    if flags == tcp::TcpFlags::SYN {
+        return flags | tcp::TcpFlags::ECE | tcp::TcpFlags::CWR;
+    }
+
+    if flags == tcp::TcpFlags::ACK && payload.is_some_and(|payload| !payload.is_empty()) {
+        return flags | tcp::TcpFlags::PSH;
+    }
+
+    flags
+}
+
+fn tcp_syn_options(flags: u8, packet_style: TcpPacketStyle) -> Vec<tcp::TcpOption> {
+    if (flags & tcp::TcpFlags::SYN) == 0 {
+        return Vec::new();
+    }
+
+    match packet_style {
+        TcpPacketStyle::Minimal => vec![tcp::TcpOption::nop(), tcp::TcpOption::wscale(14)],
+        TcpPacketStyle::Realistic => vec![
+            tcp::TcpOption::mss(1460),
+            tcp::TcpOption::sack_perm(),
+            tcp::TcpOption::timestamp(current_tcp_timestamp(), 0),
+            tcp::TcpOption::nop(),
+            tcp::TcpOption::wscale(7),
+        ],
+    }
+}
+
+fn tcp_option_size(option: &tcp::TcpOption) -> usize {
+    1 + option.length.len() + option.data.len()
+}
+
+fn current_tcp_timestamp() -> u32 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    now as u32
 }
 
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {

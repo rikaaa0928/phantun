@@ -3,7 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{PayloadPaddingConfig, Socket, Stack};
+use fake_tcp::{ClientHandshakeConfig, PayloadPaddingConfig, Socket, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
@@ -120,6 +120,13 @@ async fn main() -> io::Result<()> {
                 .value_parser(clap::value_parser!(u8).range(1..=255))
                 .default_value("5")
         )
+        .arg(
+            Arg::new("realistic_syn")
+                .long("realistic-syn")
+                .required(false)
+                .help("Use a more realistic TCP packet profile with ECN SYN, random initial sequence number, common TCP options, and PSH on payload-bearing ACKs")
+                .action(ArgAction::SetTrue)
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -195,6 +202,9 @@ async fn main() -> io::Result<()> {
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
     let mut stack = Stack::new_with_config(tun, tun_peer, tun_peer6, payload_padding);
+    stack.set_client_handshake_config(ClientHandshakeConfig {
+        realistic_syn: matches.get_flag("realistic_syn"),
+    });
 
     let main_loop = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
