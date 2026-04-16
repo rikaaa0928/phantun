@@ -121,10 +121,10 @@ async fn main() -> io::Result<()> {
                 .default_value("5")
         )
         .arg(
-            Arg::new("accept_syn_extensions")
-                .long("accept-syn-extensions")
+            Arg::new("tcp_extensions")
+                .long("tcp-extensions")
                 .required(false)
-                .help("Accept incoming SYN packets that include SYN without ACK/FIN/RST, allowing ECN bits such as ECE/CWR")
+                .help("Accept incoming TCP handshake packets that include SYN without ACK/FIN/RST, allowing common extensions such as ECE/CWR")
                 .action(ArgAction::SetTrue)
         )
         .arg(
@@ -207,7 +207,7 @@ async fn main() -> io::Result<()> {
     //thread::sleep(time::Duration::from_secs(5));
     let mut stack = Stack::new_with_config(tun, tun_local, tun_local6, payload_padding);
     stack.set_server_handshake_config(ServerHandshakeConfig {
-        allow_syn_extensions: matches.get_flag("accept_syn_extensions"),
+        tcp_extensions: matches.get_flag("tcp_extensions"),
         accept_nonzero_syn_seq: matches.get_flag("accept_nonzero_syn_seq"),
     });
     stack.listen(local_port);

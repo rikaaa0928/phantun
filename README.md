@@ -209,6 +209,14 @@ To add random padding before each real payload, enable `--payload-padding` on bo
 server. Use `--payload-padding-max-len` to control the maximum padding length. The minimum value
 is `1`, and the default maximum is `5`.
 
+To make the fake TCP handshake look more like a common TCP stack, enable `--tcp-extensions` on
+both client and server. This lets the client send a more realistic SYN profile and allows the
+server to accept SYN packets that include common TCP extension bits such as ECE/CWR.
+
+If you need to test compatibility with middleboxes that rewrite the initial TCP sequence number,
+enable `--random-initial-seq` on the client and `--accept-nonzero-syn-seq` on the server. These
+flags are mainly intended for testing and should not be required on a direct end-to-end path.
+
 [Back to TOC](#table-of-contents)
 
 ### Server
@@ -224,6 +232,12 @@ Or use host name with `--remote`:
 
 ```
 RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote example.com:1234
+```
+
+Recommended when the client also uses `--tcp-extensions`:
+
+```
+RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --tcp-extensions
 ```
 
 Note: Server by default assigns both IPv4 and IPv6 private address to the Tun interface.
@@ -245,6 +259,12 @@ Or use host name with `--remote`:
 
 ```
 RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote example.com:4567
+```
+
+Recommended when the server also uses `--tcp-extensions`:
+
+```
+RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote example.com:4567 --tcp-extensions
 ```
 
 <details>

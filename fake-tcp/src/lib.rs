@@ -82,13 +82,14 @@ impl Default for PayloadPaddingConfig {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerHandshakeConfig {
-    pub allow_syn_extensions: bool,
+    pub tcp_extensions: bool,
     pub accept_nonzero_syn_seq: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClientHandshakeConfig {
-    pub realistic_syn: bool,
+    pub tcp_extensions: bool,
+    pub random_initial_seq: bool,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -113,9 +114,10 @@ struct Shared {
     ready: mpsc::Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
     payload_padding: PayloadPaddingConfig,
-    allow_syn_extensions: AtomicBool,
+    tcp_extensions: AtomicBool,
     accept_nonzero_syn_seq: AtomicBool,
-    realistic_syn: AtomicBool,
+    client_tcp_extensions: AtomicBool,
+    random_initial_seq: AtomicBool,
 }
 
 pub struct Stack {
@@ -201,7 +203,7 @@ impl Socket {
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
-        let initial_seq = if ack.is_none() && shared.realistic_syn.load(Ordering::Relaxed) {
+        let initial_seq = if ack.is_none() && shared.random_initial_seq.load(Ordering::Relaxed) {
             SmallRng::from_os_rng().random::<u32>()
         } else {
             0
@@ -226,14 +228,15 @@ impl Socket {
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
-        let packet_style =
-            if flags == tcp::TcpFlags::SYN && self.shared.realistic_syn.load(Ordering::Relaxed) {
-                TcpPacketStyle::Realistic
-            } else if payload.is_some() && self.shared.realistic_syn.load(Ordering::Relaxed) {
-                TcpPacketStyle::Realistic
-            } else {
-                TcpPacketStyle::Minimal
-            };
+        let packet_style = if flags == tcp::TcpFlags::SYN
+            && self.shared.client_tcp_extensions.load(Ordering::Relaxed)
+        {
+            TcpPacketStyle::Realistic
+        } else if payload.is_some() && self.shared.client_tcp_extensions.load(Ordering::Relaxed) {
+            TcpPacketStyle::Realistic
+        } else {
+            TcpPacketStyle::Minimal
+        };
 
         build_tcp_packet_with_style(
             self.local_addr,
@@ -478,9 +481,10 @@ impl Stack {
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
             payload_padding,
-            allow_syn_extensions: AtomicBool::new(false),
+            tcp_extensions: AtomicBool::new(false),
             accept_nonzero_syn_seq: AtomicBool::new(false),
-            realistic_syn: AtomicBool::new(false),
+            client_tcp_extensions: AtomicBool::new(false),
+            random_initial_seq: AtomicBool::new(false),
         });
 
         for t in tun {
@@ -506,8 +510,8 @@ impl Stack {
 
     pub fn set_server_handshake_config(&self, config: ServerHandshakeConfig) {
         self.shared
-            .allow_syn_extensions
-            .store(config.allow_syn_extensions, Ordering::Relaxed);
+            .tcp_extensions
+            .store(config.tcp_extensions, Ordering::Relaxed);
         self.shared
             .accept_nonzero_syn_seq
             .store(config.accept_nonzero_syn_seq, Ordering::Relaxed);
@@ -515,8 +519,11 @@ impl Stack {
 
     pub fn set_client_handshake_config(&self, config: ClientHandshakeConfig) {
         self.shared
-            .realistic_syn
-            .store(config.realistic_syn, Ordering::Relaxed);
+            .client_tcp_extensions
+            .store(config.tcp_extensions, Ordering::Relaxed);
+        self.shared
+            .random_initial_seq
+            .store(config.random_initial_seq, Ordering::Relaxed);
     }
 
     /// Accepts an incoming connection.
@@ -622,7 +629,7 @@ impl Stack {
 
                             if is_server_syn(
                                 tcp_packet.get_flags(),
-                                shared.allow_syn_extensions.load(Ordering::Relaxed),
+                                shared.tcp_extensions.load(Ordering::Relaxed),
                             )
                                 && shared
                                     .listening
@@ -777,14 +784,15 @@ mod tests {
     #[test]
     fn server_handshake_config_defaults_disabled() {
         let config = ServerHandshakeConfig::default();
-        assert!(!config.allow_syn_extensions);
+        assert!(!config.tcp_extensions);
         assert!(!config.accept_nonzero_syn_seq);
     }
 
     #[test]
     fn client_handshake_config_defaults_disabled() {
         let config = ClientHandshakeConfig::default();
-        assert!(!config.realistic_syn);
+        assert!(!config.tcp_extensions);
+        assert!(!config.random_initial_seq);
     }
 
     #[test]

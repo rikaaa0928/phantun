@@ -121,10 +121,17 @@ async fn main() -> io::Result<()> {
                 .default_value("5")
         )
         .arg(
-            Arg::new("realistic_syn")
-                .long("realistic-syn")
+            Arg::new("tcp_extensions")
+                .long("tcp-extensions")
                 .required(false)
-                .help("Use a more realistic TCP packet profile with ECN SYN, random initial sequence number, common TCP options, and PSH on payload-bearing ACKs")
+                .help("Use a more realistic TCP packet profile with ECN SYN, common TCP options, and PSH on payload-bearing ACKs")
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("random_initial_seq")
+                .long("random-initial-seq")
+                .required(false)
+                .help("Use a random initial TCP sequence number instead of starting from zero")
                 .action(ArgAction::SetTrue)
         )
         .get_matches();
@@ -203,7 +210,8 @@ async fn main() -> io::Result<()> {
 
     let mut stack = Stack::new_with_config(tun, tun_peer, tun_peer6, payload_padding);
     stack.set_client_handshake_config(ClientHandshakeConfig {
-        realistic_syn: matches.get_flag("realistic_syn"),
+        tcp_extensions: matches.get_flag("tcp_extensions"),
+        random_initial_seq: matches.get_flag("random_initial_seq"),
     });
 
     let main_loop = tokio::spawn(async move {
