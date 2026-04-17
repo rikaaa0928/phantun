@@ -3,7 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{ClientHandshakeConfig, PayloadPaddingConfig, Socket, Stack};
+use fake_tcp::{ClientHandshakeConfig, ObfuscateConfig, PayloadPaddingConfig, Socket, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
@@ -121,6 +121,34 @@ async fn main() -> io::Result<()> {
                 .default_value("5")
         )
         .arg(
+            Arg::new("obfuscate")
+                .long("obfuscate")
+                .env("PHANTUN_OBFUSCATE")
+                .required(false)
+                .help("Occasionally send dummy packets with random padding; requires --payload-padding enabled")
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("obfuscate_prob")
+                .long("obfuscate-prob")
+                .env("PHANTUN_OBFUSCATE_PROB")
+                .required(false)
+                .value_name("PERCENT")
+                .help("Probability (in percent) to send an obfuscation packet when sending a payload packet")
+                .value_parser(clap::value_parser!(f64))
+                .default_value("5.0")
+        )
+        .arg(
+            Arg::new("obfuscate_max_len")
+                .long("obfuscate-max-len")
+                .env("PHANTUN_OBFUSCATE_MAX_LEN")
+                .required(false)
+                .value_name("LEN")
+                .help("Maximum random padding length for an obfuscation packet")
+                .value_parser(clap::value_parser!(u8).range(1..=255))
+                .default_value("255")
+        )
+        .arg(
             Arg::new("tcp_extensions")
                 .long("tcp-extensions")
                 .required(false)
@@ -187,6 +215,16 @@ async fn main() -> io::Result<()> {
             .expect("payload padding max len has a default"),
     };
 
+    let obfuscate = ObfuscateConfig {
+        enabled: matches.get_flag("obfuscate"),
+        prob_percent: *matches
+            .get_one::<f64>("obfuscate_prob")
+            .expect("obfuscate prob has a default"),
+        max_len: *matches
+            .get_one::<u8>("obfuscate_max_len")
+            .expect("obfuscate max len has a default"),
+    };
+
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
@@ -208,7 +246,7 @@ async fn main() -> io::Result<()> {
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
-    let mut stack = Stack::new_with_config(tun, tun_peer, tun_peer6, payload_padding);
+    let mut stack = Stack::new_with_config(tun, tun_peer, tun_peer6, payload_padding, obfuscate);
     stack.set_client_handshake_config(ClientHandshakeConfig {
         tcp_extensions: matches.get_flag("tcp_extensions"),
         random_initial_seq: matches.get_flag("random_initial_seq"),
