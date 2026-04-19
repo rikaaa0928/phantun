@@ -80,6 +80,23 @@ impl Default for PayloadPaddingConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ObfuscateConfig {
+    pub enabled: bool,
+    pub prob_percent: f64,
+    pub max_len: u8,
+}
+
+impl Default for ObfuscateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prob_percent: 5.0,
+            max_len: 255,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerHandshakeConfig {
     pub tcp_extensions: bool,
@@ -114,6 +131,7 @@ struct Shared {
     ready: mpsc::Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
     payload_padding: PayloadPaddingConfig,
+    obfuscate: ObfuscateConfig,
     tcp_extensions: AtomicBool,
     accept_nonzero_syn_seq: AtomicBool,
     client_tcp_extensions: AtomicBool,
@@ -228,11 +246,9 @@ impl Socket {
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
-        let packet_style = if flags == tcp::TcpFlags::SYN
+        let packet_style = if (flags == tcp::TcpFlags::SYN || payload.is_some())
             && self.shared.client_tcp_extensions.load(Ordering::Relaxed)
         {
-            TcpPacketStyle::Realistic
-        } else if payload.is_some() && self.shared.client_tcp_extensions.load(Ordering::Relaxed) {
             TcpPacketStyle::Realistic
         } else {
             TcpPacketStyle::Minimal
@@ -259,6 +275,30 @@ impl Socket {
     pub async fn send(&self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
+                if self.shared.payload_padding.enabled && self.shared.obfuscate.enabled {
+                    let should_obfuscate = {
+                        let mut rng = rand::rng();
+                        rng.random_range(0.0..100.0) < self.shared.obfuscate.prob_percent
+                    };
+
+                    if should_obfuscate {
+                        let obfuscate_payload = Self::encode_payload(
+                            &[],
+                            PayloadPaddingConfig {
+                                enabled: true,
+                                max_len: self.shared.obfuscate.max_len,
+                            },
+                        );
+                        let buf = self
+                            .build_tcp_packet(tcp::TcpFlags::ACK, Some(obfuscate_payload.as_ref()));
+                        self.seq
+                            .fetch_add(obfuscate_payload.len() as u32, Ordering::Relaxed);
+                        if self.tun.send(&buf).await.is_err() {
+                            return None;
+                        }
+                    }
+                }
+
                 let payload = Self::encode_payload(payload, self.shared.payload_padding);
                 let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload.as_ref()));
                 self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
@@ -277,42 +317,46 @@ impl Socket {
     /// and this socket must be closed.
     pub async fn recv(&self, buf: &mut [u8]) -> Option<usize> {
         match self.state {
-            State::Established => {
-                self.incoming.recv_async().await.ok().and_then(|raw_buf| {
-                    let (_v4_packet, tcp_packet) = parse_ip_packet(&raw_buf).unwrap();
+            State::Established => loop {
+                let raw_buf = self.incoming.recv_async().await.ok()?;
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
-                        info!("Connection {} reset by peer", self);
+                let (_v4_packet, tcp_packet) = parse_ip_packet(&raw_buf).unwrap();
+
+                if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                    info!("Connection {} reset by peer", self);
+                    return None;
+                }
+
+                let payload = tcp_packet.payload();
+
+                let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                let last_ask = self.last_ack.load(Ordering::Relaxed);
+                self.ack.store(new_ack, Ordering::Relaxed);
+
+                if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
+                    let ack_buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                    if let Err(e) = self.tun.try_send(&ack_buf) {
+                        // This should not really happen as we have not sent anything for
+                        // quite some time...
+                        info!("Connection {} unable to send idling ACK back: {}", self, e)
+                    }
+                }
+
+                let payload = match Self::decode_payload(payload, self.shared.payload_padding) {
+                    Some(payload) => payload,
+                    None => {
+                        warn!("Connection {} received malformed padded payload", self);
                         return None;
                     }
+                };
 
-                    let payload = tcp_packet.payload();
+                if payload.is_empty() {
+                    continue; // Ignore dummy packets
+                }
 
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    let last_ask = self.last_ack.load(Ordering::Relaxed);
-                    self.ack.store(new_ack, Ordering::Relaxed);
-
-                    if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
-                        let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
-                        if let Err(e) = self.tun.try_send(&buf) {
-                            // This should not really happen as we have not sent anything for
-                            // quite some time...
-                            info!("Connection {} unable to send idling ACK back: {}", self, e)
-                        }
-                    }
-
-                    let payload = match Self::decode_payload(payload, self.shared.payload_padding) {
-                        Some(payload) => payload,
-                        None => {
-                            warn!("Connection {} received malformed padded payload", self);
-                            return None;
-                        }
-                    };
-                    buf[..payload.len()].copy_from_slice(payload);
-
-                    Some(payload.len())
-                })
-            }
+                buf[..payload.len()].copy_from_slice(payload);
+                return Some(payload.len());
+            },
             _ => unreachable!(),
         }
     }
@@ -457,7 +501,13 @@ impl Stack {
     /// of reader will be spawned later. This allows user to utilize the performance
     /// benefit of Multiqueue Tun support on machines with SMP.
     pub fn new(tun: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
-        Self::new_with_config(tun, local_ip, local_ip6, PayloadPaddingConfig::default())
+        Self::new_with_config(
+            tun,
+            local_ip,
+            local_ip6,
+            PayloadPaddingConfig::default(),
+            ObfuscateConfig::default(),
+        )
     }
 
     /// Create a new stack with optional payload padding support.
@@ -466,10 +516,16 @@ impl Stack {
         local_ip: Ipv4Addr,
         local_ip6: Option<Ipv6Addr>,
         payload_padding: PayloadPaddingConfig,
+        obfuscate: ObfuscateConfig,
     ) -> Stack {
         let payload_padding = PayloadPaddingConfig {
             enabled: payload_padding.enabled,
             max_len: payload_padding.max_len.max(1),
+        };
+        let obfuscate = ObfuscateConfig {
+            enabled: obfuscate.enabled,
+            prob_percent: obfuscate.prob_percent.clamp(0.0, 100.0),
+            max_len: obfuscate.max_len.max(1),
         };
         let tun: Vec<Arc<Tun>> = tun.into_iter().map(Arc::new).collect();
         let (ready_tx, ready_rx) = mpsc::channel(MPSC_BUFFER_LEN);
@@ -481,6 +537,7 @@ impl Stack {
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
             payload_padding,
+            obfuscate,
             tcp_extensions: AtomicBool::new(false),
             accept_nonzero_syn_seq: AtomicBool::new(false),
             client_tcp_extensions: AtomicBool::new(false),
